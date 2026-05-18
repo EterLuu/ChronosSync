@@ -1,0 +1,40 @@
+# Chronos 配置文件
+
+# Radicale CalDAV 服务器配置
+radicale:
+  url: "http://radicale:5232"
+  username: "user"
+  password: "password"
+  # 多日历支持：每个日历可指定类型
+  # type: todos (仅待办), calendar (仅日历事件), calendar_and_todos (两者)
+  calendars:
+    - path: "/user/calender_1/"
+      type: "calendar_and_todos"
+    - path: "/user/calender_2/"
+      type: "calendar"
+
+# 水墨屏设备 API 配置
+device:
+  api_url: "https://cloud.zectrix.com/open/v1"
+  api_key: "api_key"
+  device_id: "AA:BB:CC:DD:EE:FF"
+
+# 同步配置
+sync:
+  # 同步间隔（秒）
+  interval: 300
+  # 冲突解决策略：device_wins, radicale_wins, manual
+  conflict_resolution: "radicale_wins"
+
+# 数据库配置
+database:
+  path: "./data/chronos.db"
+
+# 日志配置
+logging:
+  level: "debug"  # debug, info, warn, error
+  file: "./logs/chronos.log"
+
+# Webhook 服务器配置
+webhook:
+  addr: ":8080"

@@ -1,0 +1,38 @@
+services:
+  chronos:
+    build: .
+    container_name: chronos
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - CHRONOS_RADICALE_URL=http://radicale:5232
+      - CHRONOS_RADICALE_USERNAME=user
+      - CHRONOS_RADICALE_PASSWORD=pass
+      - CHRONOS_DEVICE_API_URL=https://cloud.zectrix.com/open/v1
+      - CHRONOS_DEVICE_API_KEY=zt_your_api_key_here
+      - CHRONOS_DEVICE_ID=AA:BB:CC:DD:EE:FF
+    depends_on:
+      - radicale
+    networks:
+      - chronos-network
+
+  radicale:
+    image: tomsquest/docker-radicale
+    container_name: radicale
+    restart: unless-stopped
+    ports:
+      - "5232:5232"
+    volumes:
+      - ./radicale/data:/data
+      - ./radicale/config:/config
+    networks:
+      - chronos-network
+
+networks:
+  chronos-network:
+    driver: bridge
