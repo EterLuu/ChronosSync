@@ -51,6 +51,7 @@ type DeviceClient interface {
 	UpdateTodo(ctx context.Context, todoID int, todo *DeviceTodo) (*DeviceTodo, error)
 	CompleteTodo(ctx context.Context, todoID int) error
 	UncompleteTodo(ctx context.Context, todoID int) error
+	DeleteTodo(ctx context.Context, todoID int) error
 	GetDeviceID() string
 }
 
@@ -332,5 +333,38 @@ func (c *zectrixClient) CompleteTodo(ctx context.Context, todoID int) error {
 
 // UncompleteTodo 标记待办事项为未完成
 func (c *zectrixClient) UncompleteTodo(ctx context.Context, todoID int) error {
+	// Zectrix 的 complete 接口是切换完成状态，同一接口也用于取消完成。
 	return c.CompleteTodo(ctx, todoID)
+}
+
+// DeleteTodo 删除待办事项。
+func (c *zectrixClient) DeleteTodo(ctx context.Context, todoID int) error {
+	url := fmt.Sprintf("%s/todos/%d", c.apiURL, todoID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("X-API-Key", c.apiKey)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var apiResp APIResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
+	}
+	if apiResp.Code != 0 {
+		return fmt.Errorf("API error: code=%d, msg=%s", apiResp.Code, apiResp.Msg)
+	}
+
+	return nil
 }

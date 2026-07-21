@@ -11,13 +11,15 @@ import (
 
 // Mapping 同步映射
 type Mapping struct {
-	ID           int64     `json:"id"`
-	CalDAVUID    string    `json:"caldav_uid"`
-	DeviceTodoID int       `json:"device_todo_id"`
-	LastSyncTime time.Time `json:"last_sync_time"`
-	CalDAVETag   string    `json:"caldav_etag"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID               int64     `json:"id"`
+	CalendarPath     string    `json:"calendar_path"`
+	CalDAVUID        string    `json:"caldav_uid"`
+	DeviceTodoID     int       `json:"device_todo_id"`
+	DeviceUpdateDate int64     `json:"device_update_date"`
+	LastSyncTime     time.Time `json:"last_sync_time"`
+	CalDAVETag       string    `json:"caldav_etag"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // Conflict 冲突记录
@@ -51,11 +53,11 @@ type SyncLog struct {
 type Store interface {
 	// 映射操作
 	CreateMapping(ctx context.Context, mapping *Mapping) error
-	GetMapping(ctx context.Context, caldavUID string) (*Mapping, error)
+	GetMapping(ctx context.Context, calendarPath, caldavUID string) (*Mapping, error)
 	GetMappingByDeviceID(ctx context.Context, deviceTodoID int) (*Mapping, error)
 	GetMappings(ctx context.Context) ([]Mapping, error)
 	UpdateMapping(ctx context.Context, mapping *Mapping) error
-	DeleteMapping(ctx context.Context, caldavUID string) error
+	DeleteMapping(ctx context.Context, calendarPath, caldavUID string) error
 
 	// 冲突操作
 	CreateConflict(ctx context.Context, conflict *Conflict) error
@@ -105,15 +107,84 @@ func NewStore(dbPath string) (Store, error) {
 
 // initDB 初始化数据库表
 func (s *sqliteStore) initDB() error {
+	// 早期版本只用 caldav_uid 做全局唯一键，多个日历中同 UID 会串联。
+	// 启动时将旧表无损迁移为 (calendar_path, caldav_uid) 复合唯一键。
+	var hasMappingsTable bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mappings')`).Scan(&hasMappingsTable); err != nil {
+		return err
+	}
+	if hasMappingsTable {
+		columns := make(map[string]bool)
+		rows, err := s.db.Query(`PRAGMA table_info(mappings)`)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var cid, notNull, primaryKey int
+			var name, columnType string
+			var defaultValue interface{}
+			if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+				rows.Close()
+				return err
+			}
+			columns[name] = true
+		}
+		rows.Close()
+
+		if !columns["calendar_path"] {
+			tx, err := s.db.Begin()
+			if err != nil {
+				return err
+			}
+			migration := `
+				ALTER TABLE mappings RENAME TO mappings_legacy;
+				CREATE TABLE mappings (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					calendar_path TEXT NOT NULL DEFAULT '',
+					caldav_uid TEXT NOT NULL,
+					device_todo_id INTEGER NOT NULL,
+					device_update_date INTEGER NOT NULL DEFAULT 0,
+					last_sync_time DATETIME NOT NULL,
+					caldav_etag TEXT,
+					created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+					updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+					UNIQUE(calendar_path, caldav_uid)
+				);
+				INSERT INTO mappings (
+					id, calendar_path, caldav_uid, device_todo_id, device_update_date,
+					last_sync_time, caldav_etag, created_at, updated_at
+				)
+				SELECT id, '', caldav_uid, device_todo_id, 0,
+					last_sync_time, caldav_etag, created_at, updated_at
+				FROM mappings_legacy;
+				DROP TABLE mappings_legacy;
+			`
+			if _, err := tx.Exec(migration); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("failed to migrate mappings table: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+		} else if !columns["device_update_date"] {
+			if _, err := s.db.Exec(`ALTER TABLE mappings ADD COLUMN device_update_date INTEGER NOT NULL DEFAULT 0`); err != nil {
+				return fmt.Errorf("failed to add device update baseline: %w", err)
+			}
+		}
+	}
+
 	schema := `
 	CREATE TABLE IF NOT EXISTS mappings (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		caldav_uid TEXT NOT NULL UNIQUE,
+		calendar_path TEXT NOT NULL DEFAULT '',
+		caldav_uid TEXT NOT NULL,
 		device_todo_id INTEGER NOT NULL,
+		device_update_date INTEGER NOT NULL DEFAULT 0,
 		last_sync_time DATETIME NOT NULL,
 		caldav_etag TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(calendar_path, caldav_uid)
 	);
 
 	CREATE TABLE IF NOT EXISTS conflicts (
@@ -141,7 +212,7 @@ func (s *sqliteStore) initDB() error {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
-	CREATE INDEX IF NOT EXISTS idx_mappings_caldav_uid ON mappings(caldav_uid);
+	CREATE INDEX IF NOT EXISTS idx_mappings_calendar_uid ON mappings(calendar_path, caldav_uid);
 	CREATE INDEX IF NOT EXISTS idx_mappings_device_todo_id ON mappings(device_todo_id);
 	CREATE INDEX IF NOT EXISTS idx_conflicts_status ON conflicts(status);
 	CREATE INDEX IF NOT EXISTS idx_sync_logs_sync_time ON sync_logs(sync_time);
@@ -154,8 +225,8 @@ func (s *sqliteStore) initDB() error {
 // CreateMapping 创建映射
 func (s *sqliteStore) CreateMapping(ctx context.Context, mapping *Mapping) error {
 	query := `
-		INSERT INTO mappings (caldav_uid, device_todo_id, last_sync_time, caldav_etag)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO mappings (calendar_path, caldav_uid, device_todo_id, device_update_date, last_sync_time, caldav_etag)
+		VALUES (?, ?, ?, ?, ?, ?)
 	`
 
 	now := time.Now()
@@ -163,8 +234,10 @@ func (s *sqliteStore) CreateMapping(ctx context.Context, mapping *Mapping) error
 	mapping.UpdatedAt = now
 
 	result, err := s.db.ExecContext(ctx, query,
+		mapping.CalendarPath,
 		mapping.CalDAVUID,
 		mapping.DeviceTodoID,
+		mapping.DeviceUpdateDate,
 		mapping.LastSyncTime,
 		mapping.CalDAVETag,
 	)
@@ -181,19 +254,21 @@ func (s *sqliteStore) CreateMapping(ctx context.Context, mapping *Mapping) error
 	return nil
 }
 
-// GetMapping 获取映射
-func (s *sqliteStore) GetMapping(ctx context.Context, caldavUID string) (*Mapping, error) {
+// GetMapping 获取指定日历内的映射
+func (s *sqliteStore) GetMapping(ctx context.Context, calendarPath, caldavUID string) (*Mapping, error) {
 	query := `
-		SELECT id, caldav_uid, device_todo_id, last_sync_time, caldav_etag, created_at, updated_at
+		SELECT id, calendar_path, caldav_uid, device_todo_id, device_update_date, last_sync_time, caldav_etag, created_at, updated_at
 		FROM mappings
-		WHERE caldav_uid = ?
+		WHERE calendar_path = ? AND caldav_uid = ?
 	`
 
 	mapping := &Mapping{}
-	err := s.db.QueryRowContext(ctx, query, caldavUID).Scan(
+	err := s.db.QueryRowContext(ctx, query, calendarPath, caldavUID).Scan(
 		&mapping.ID,
+		&mapping.CalendarPath,
 		&mapping.CalDAVUID,
 		&mapping.DeviceTodoID,
+		&mapping.DeviceUpdateDate,
 		&mapping.LastSyncTime,
 		&mapping.CalDAVETag,
 		&mapping.CreatedAt,
@@ -212,7 +287,7 @@ func (s *sqliteStore) GetMapping(ctx context.Context, caldavUID string) (*Mappin
 // GetMappingByDeviceID 根据设备ID获取映射
 func (s *sqliteStore) GetMappingByDeviceID(ctx context.Context, deviceTodoID int) (*Mapping, error) {
 	query := `
-		SELECT id, caldav_uid, device_todo_id, last_sync_time, caldav_etag, created_at, updated_at
+		SELECT id, calendar_path, caldav_uid, device_todo_id, device_update_date, last_sync_time, caldav_etag, created_at, updated_at
 		FROM mappings
 		WHERE device_todo_id = ?
 	`
@@ -220,8 +295,10 @@ func (s *sqliteStore) GetMappingByDeviceID(ctx context.Context, deviceTodoID int
 	mapping := &Mapping{}
 	err := s.db.QueryRowContext(ctx, query, deviceTodoID).Scan(
 		&mapping.ID,
+		&mapping.CalendarPath,
 		&mapping.CalDAVUID,
 		&mapping.DeviceTodoID,
+		&mapping.DeviceUpdateDate,
 		&mapping.LastSyncTime,
 		&mapping.CalDAVETag,
 		&mapping.CreatedAt,
@@ -240,7 +317,7 @@ func (s *sqliteStore) GetMappingByDeviceID(ctx context.Context, deviceTodoID int
 // GetMappings 获取所有映射
 func (s *sqliteStore) GetMappings(ctx context.Context) ([]Mapping, error) {
 	query := `
-		SELECT id, caldav_uid, device_todo_id, last_sync_time, caldav_etag, created_at, updated_at
+		SELECT id, calendar_path, caldav_uid, device_todo_id, device_update_date, last_sync_time, caldav_etag, created_at, updated_at
 		FROM mappings
 		ORDER BY id
 	`
@@ -256,8 +333,10 @@ func (s *sqliteStore) GetMappings(ctx context.Context) ([]Mapping, error) {
 		var mapping Mapping
 		if err := rows.Scan(
 			&mapping.ID,
+			&mapping.CalendarPath,
 			&mapping.CalDAVUID,
 			&mapping.DeviceTodoID,
+			&mapping.DeviceUpdateDate,
 			&mapping.LastSyncTime,
 			&mapping.CalDAVETag,
 			&mapping.CreatedAt,
@@ -275,18 +354,20 @@ func (s *sqliteStore) GetMappings(ctx context.Context) ([]Mapping, error) {
 func (s *sqliteStore) UpdateMapping(ctx context.Context, mapping *Mapping) error {
 	query := `
 		UPDATE mappings
-		SET device_todo_id = ?, last_sync_time = ?, caldav_etag = ?, updated_at = ?
-		WHERE caldav_uid = ?
+		SET calendar_path = ?, device_todo_id = ?, device_update_date = ?, last_sync_time = ?, caldav_etag = ?, updated_at = ?
+		WHERE id = ?
 	`
 
 	mapping.UpdatedAt = time.Now()
 
 	_, err := s.db.ExecContext(ctx, query,
+		mapping.CalendarPath,
 		mapping.DeviceTodoID,
+		mapping.DeviceUpdateDate,
 		mapping.LastSyncTime,
 		mapping.CalDAVETag,
 		mapping.UpdatedAt,
-		mapping.CalDAVUID,
+		mapping.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update mapping: %w", err)
@@ -295,11 +376,11 @@ func (s *sqliteStore) UpdateMapping(ctx context.Context, mapping *Mapping) error
 	return nil
 }
 
-// DeleteMapping 删除映射
-func (s *sqliteStore) DeleteMapping(ctx context.Context, caldavUID string) error {
-	query := `DELETE FROM mappings WHERE caldav_uid = ?`
+// DeleteMapping 删除指定日历内的映射
+func (s *sqliteStore) DeleteMapping(ctx context.Context, calendarPath, caldavUID string) error {
+	query := `DELETE FROM mappings WHERE calendar_path = ? AND caldav_uid = ?`
 
-	_, err := s.db.ExecContext(ctx, query, caldavUID)
+	_, err := s.db.ExecContext(ctx, query, calendarPath, caldavUID)
 	if err != nil {
 		return fmt.Errorf("failed to delete mapping: %w", err)
 	}

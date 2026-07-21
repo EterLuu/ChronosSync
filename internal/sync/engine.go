@@ -42,12 +42,13 @@ type SyncEngine struct {
 	store          store.Store
 	conflictPolicy ConflictResolution
 	logger         *log.Logger
+	now            func() time.Time
 }
 
-func (e *SyncEngine) primaryClient() caldav.CalDAVClient {
-	for _, c := range e.calendars {
-		if c.CalType == CalTypeTodos || c.CalType == CalTypeCalendarAndTodos {
-			return c.Client
+func (e *SyncEngine) primaryCalendar() *CalendarEntry {
+	for i := range e.calendars {
+		if e.calendars[i].CalType == CalTypeTodos || e.calendars[i].CalType == CalTypeCalendarAndTodos {
+			return &e.calendars[i]
 		}
 	}
 	return nil
@@ -76,6 +77,7 @@ func NewSyncEngine(
 		store:          store,
 		conflictPolicy: conflictPolicy,
 		logger:         logger,
+		now:            time.Now,
 	}
 }
 
@@ -95,20 +97,19 @@ func (r *SyncResult) merge(other *SyncResult) {
 	r.Errors = append(r.Errors, other.Errors...)
 }
 
-// refreshDeviceIndex 重新拉取设备待办列表并重建索引
 func (e *SyncEngine) refreshDeviceIndex(ctx context.Context) (map[int]device.DeviceTodo, error) {
 	todos, err := e.deviceClient.GetTodos(ctx, e.deviceClient.GetDeviceID(), nil)
 	if err != nil {
 		return nil, err
 	}
 	idx := make(map[int]device.DeviceTodo, len(todos))
-	for _, t := range todos {
-		idx[t.ID] = t
+	for _, todo := range todos {
+		idx[todo.ID] = todo
 	}
 	return idx, nil
 }
 
-// Sync 执行同步（单次完整流程）
+// Sync 执行一次完整同步。VTODO 双向同步；VEVENT 只由 CalDAV 投影到设备。
 func (e *SyncEngine) Sync(ctx context.Context) (*SyncResult, error) {
 	e.logger.Println("Starting sync...")
 	result := &SyncResult{}
@@ -117,77 +118,70 @@ func (e *SyncEngine) Sync(ctx context.Context) (*SyncResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get device todos: %w", err)
 	}
-
 	mappings, err := e.store.GetMappings(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get mappings: %w", err)
 	}
 
-	// 建立 event mapped 的设备待办 ID 集合（这些不应回写）
-	eventDeviceIDs := make(map[int]bool)
-	for _, m := range mappings {
-		if strings.HasPrefix(m.CalDAVUID, eventUIDPrefix) {
-			eventDeviceIDs[m.DeviceTodoID] = true
+	// 旧版本的事件映射没有日历路径且一个重复系列只保留一条映射，无法可靠
+	// 判断所属日历或实例。清理一次后会按新的实例键重建当前应显示的事件。
+	result.merge(e.cleanupLegacyEventMappings(ctx, deviceIndex, mappings))
+	mappings, err = e.store.GetMappings(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to refresh mappings: %w", err)
+	}
+
+	legacyTodoOwnerAssigned := false
+	for i := range e.calendars {
+		entry := e.calendars[i]
+		e.logger.Printf("Processing calendar: %s (type=%s)", entry.Path, entry.CalType)
+
+		if entry.CalType == CalTypeTodos || entry.CalType == CalTypeCalendarAndTodos {
+			claimLegacy := !legacyTodoOwnerAssigned
+			legacyTodoOwnerAssigned = true
+			result.merge(e.syncTodos(ctx, entry, deviceIndex, mappings, claimLegacy))
+			mappings, err = e.store.GetMappings(ctx)
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("refresh mappings after todos: %w", err))
+				continue
+			}
+		}
+
+		if entry.CalType == CalTypeCalendar || entry.CalType == CalTypeCalendarAndTodos {
+			result.merge(e.syncEvents(ctx, entry, deviceIndex, mappings))
+			mappings, err = e.store.GetMappings(ctx)
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("refresh mappings after events: %w", err))
+				continue
+			}
 		}
 	}
 
-	for _, cal := range e.calendars {
-		e.logger.Printf("Processing calendar: %s (type=%s)", cal.Path, cal.CalType)
-
-		switch cal.CalType {
-		case CalTypeTodos:
-			res := e.syncTodos(ctx, cal.Client, deviceIndex, mappings)
-			result.merge(res)
-		case CalTypeCalendar:
-			res := e.syncEvents(ctx, cal.Client, deviceIndex, mappings, eventDeviceIDs)
-			result.EventsCreated += res.EventsCreated
-			result.Errors = append(result.Errors, res.Errors...)
-		case CalTypeCalendarAndTodos:
-			res := e.syncTodos(ctx, cal.Client, deviceIndex, mappings)
-			result.merge(res)
-			// 刷新 deviceIndex — syncTodos 可能创建了新待办
-			if res.Created > 0 {
-				deviceIndex, _ = e.refreshDeviceIndex(ctx)
-			}
-			evRes := e.syncEvents(ctx, cal.Client, deviceIndex, mappings, eventDeviceIDs)
-			result.EventsCreated += evRes.EventsCreated
-			result.Errors = append(result.Errors, evRes.Errors...)
-		}
-
-		// 刷新 eventDeviceIDs
-		if result.EventsCreated > 0 || result.Created > 0 {
-			mappings, _ = e.store.GetMappings(ctx)
-			eventDeviceIDs = make(map[int]bool)
-			for _, m := range mappings {
-				if strings.HasPrefix(m.CalDAVUID, eventUIDPrefix) {
-					eventDeviceIDs[m.DeviceTodoID] = true
-				}
-			}
-		}
-
-		mappings, _ = e.store.GetMappings(ctx)
+	deviceIndex, err = e.refreshDeviceIndex(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to refresh device todos: %w", err)
+	}
+	mappings, err = e.store.GetMappings(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to refresh final mappings: %w", err)
 	}
 
-	// 刷新最终设备列表（用于 Device→CalDAV）
-	deviceIndex, _ = e.refreshDeviceIndex(ctx)
+	mappedDeviceIDs := make(map[int]bool, len(mappings))
+	for _, mapping := range mappings {
+		mappedDeviceIDs[mapping.DeviceTodoID] = true
+	}
 
-	// Device → CalDAV：跳过事件衍生的待办
-	for _, dt := range deviceIndex {
-		if eventDeviceIDs[dt.ID] {
-			continue
-		}
-		hasMapping := false
-		for _, m := range mappings {
-			if m.DeviceTodoID == dt.ID {
-				hasMapping = true
-				break
+	// 未映射的设备待办写入第一个启用 VTODO 的日历。没有 VTODO 日历时，
+	// 设备待办保持原样，不会因为仅配置事件日历而触发空指针或误写。
+	if primary := e.primaryCalendar(); primary != nil {
+		for _, deviceTodo := range deviceIndex {
+			if mappedDeviceIDs[deviceTodo.ID] {
+				continue
 			}
-		}
-		if !hasMapping {
-			e.logger.Printf("New device todo: %d (%s)", dt.ID, dt.Title)
-			caldavTodo := e.convertDeviceToCalDAV(&dt)
-			if err := e.createCalDAVTodoWithMapping(ctx, caldavTodo, dt.ID); err != nil {
-				result.Errors = append(result.Errors, fmt.Errorf("failed to sync device todo %d: %w", dt.ID, err))
+			e.logger.Printf("New device todo: %d (%s)", deviceTodo.ID, deviceTodo.Title)
+			caldavTodo := e.convertDeviceToCalDAV(&deviceTodo)
+			if err := e.createCalDAVTodoWithMapping(ctx, *primary, caldavTodo, deviceTodo); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("failed to sync device todo %d: %w", deviceTodo.ID, err))
 				continue
 			}
 			result.Created++
@@ -199,355 +193,574 @@ func (e *SyncEngine) Sync(ctx context.Context) (*SyncResult, error) {
 	return result, nil
 }
 
-// syncTodos 同步单个日历的 VTODO
-func (e *SyncEngine) syncTodos(ctx context.Context, client caldav.CalDAVClient, deviceIndex map[int]device.DeviceTodo, mappings []store.Mapping) *SyncResult {
+func (e *SyncEngine) cleanupLegacyEventMappings(ctx context.Context, deviceIndex map[int]device.DeviceTodo, mappings []store.Mapping) *SyncResult {
 	result := &SyncResult{}
-	caldavTodos, err := client.GetTodos(ctx)
+	for _, mapping := range mappings {
+		if mapping.CalendarPath != "" || !strings.HasPrefix(mapping.CalDAVUID, eventUIDPrefix) {
+			continue
+		}
+		if _, exists := deviceIndex[mapping.DeviceTodoID]; exists {
+			if err := e.deviceClient.DeleteTodo(ctx, mapping.DeviceTodoID); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("delete legacy event todo %d: %w", mapping.DeviceTodoID, err))
+				continue
+			}
+			delete(deviceIndex, mapping.DeviceTodoID)
+			result.Deleted++
+		}
+		if err := e.store.DeleteMapping(ctx, mapping.CalendarPath, mapping.CalDAVUID); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("delete legacy event mapping %s: %w", mapping.CalDAVUID, err))
+		}
+	}
+	return result
+}
+
+// syncTodos 同步单个日历的 VTODO，并传播两端的删除。
+func (e *SyncEngine) syncTodos(ctx context.Context, entry CalendarEntry, deviceIndex map[int]device.DeviceTodo, mappings []store.Mapping, claimLegacy bool) *SyncResult {
+	result := &SyncResult{}
+	caldavTodos, err := entry.Client.GetTodos(ctx)
 	if err != nil {
-		result.Errors = append(result.Errors, fmt.Errorf("failed to get CalDAV todos: %w", err))
+		result.Errors = append(result.Errors, fmt.Errorf("failed to get CalDAV todos from %s: %w", entry.Path, err))
 		return result
 	}
 
 	mappingByUID := make(map[string]*store.Mapping)
 	for i := range mappings {
-		mappingByUID[mappings[i].CalDAVUID] = &mappings[i]
+		mapping := &mappings[i]
+		if strings.HasPrefix(mapping.CalDAVUID, eventUIDPrefix) {
+			continue
+		}
+		if mapping.CalendarPath == entry.Path || (claimLegacy && mapping.CalendarPath == "") {
+			if mapping.CalendarPath == "" {
+				mapping.CalendarPath = entry.Path
+				if err := e.store.UpdateMapping(ctx, mapping); err != nil {
+					result.Errors = append(result.Errors, fmt.Errorf("claim legacy mapping %s: %w", mapping.CalDAVUID, err))
+					continue
+				}
+			}
+			mappingByUID[mapping.CalDAVUID] = mapping
+		}
 	}
 
-	caldavByUID := make(map[string]caldav.TodoItem)
-	for _, t := range caldavTodos {
-		caldavByUID[t.UID] = t
+	caldavByUID := make(map[string]caldav.TodoItem, len(caldavTodos))
+	for _, todo := range caldavTodos {
+		if todo.UID != "" {
+			caldavByUID[todo.UID] = todo
+		}
 	}
 
-	for uid, ct := range caldavByUID {
+	// CalDAV 端删除：删除设备待办及映射。
+	for uid, mapping := range mappingByUID {
+		if _, exists := caldavByUID[uid]; exists {
+			continue
+		}
+		if _, deviceExists := deviceIndex[mapping.DeviceTodoID]; deviceExists {
+			if err := e.deviceClient.DeleteTodo(ctx, mapping.DeviceTodoID); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("delete device todo %d: %w", mapping.DeviceTodoID, err))
+				continue
+			}
+			delete(deviceIndex, mapping.DeviceTodoID)
+			result.Deleted++
+		}
+		if err := e.store.DeleteMapping(ctx, entry.Path, uid); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("delete mapping %s: %w", uid, err))
+		}
+		delete(mappingByUID, uid)
+	}
+
+	for uid, caldavTodo := range caldavByUID {
 		mapping, hasMapping := mappingByUID[uid]
 		if !hasMapping {
 			e.logger.Printf("New CalDAV todo: %s", uid)
-			deviceTodo := e.convertCalDAVToDevice(&ct)
+			deviceTodo := e.convertCalDAVToDevice(&caldavTodo)
 			created, err := e.deviceClient.CreateTodo(ctx, deviceTodo)
 			if err != nil {
 				result.Errors = append(result.Errors, fmt.Errorf("create device todo: %w", err))
 				continue
 			}
-			if ct.Status == "COMPLETED" {
-				e.deviceClient.CompleteTodo(ctx, created.ID)
+			if isCalDAVCompleted(caldavTodo) && !isDeviceCompleted(*created) {
+				if err := e.deviceClient.CompleteTodo(ctx, created.ID); err != nil {
+					e.deviceClient.DeleteTodo(ctx, created.ID)
+					result.Errors = append(result.Errors, fmt.Errorf("complete new device todo: %w", err))
+					continue
+				}
 			}
+
 			newMapping := &store.Mapping{
-				CalDAVUID:    uid,
-				DeviceTodoID: created.ID,
-				LastSyncTime: time.Now(),
-				CalDAVETag:   ct.ETag,
+				CalendarPath:     entry.Path,
+				CalDAVUID:        uid,
+				DeviceTodoID:     created.ID,
+				DeviceUpdateDate: created.UpdateDate,
+				LastSyncTime:     e.now(),
+				CalDAVETag:       caldavTodo.ETag,
 			}
 			if err := e.safeCreateMapping(ctx, newMapping); err != nil {
-				e.logger.Printf("Rolling back orphan device todo %d", created.ID)
-				e.deviceClient.CompleteTodo(ctx, created.ID)
+				e.deviceClient.DeleteTodo(ctx, created.ID)
 				result.Errors = append(result.Errors, fmt.Errorf("create mapping: %w", err))
 				continue
 			}
-			// 即时更新 deviceIndex，避免陈旧数据
-			created.Status = deviceTodo.Status
-			created.Completed = deviceTodo.Completed
-			deviceIndex[created.ID] = *created
+			indexed := *deviceTodo
+			indexed.ID = created.ID
+			indexed.UpdateDate = created.UpdateDate
+			deviceIndex[created.ID] = indexed
 			result.Created++
-		} else {
-			dt, deviceExists := deviceIndex[mapping.DeviceTodoID]
-			if !deviceExists {
-				e.logger.Printf("Mapped device todo %d gone, deleting CalDAV %s", mapping.DeviceTodoID, uid)
-				if err := client.DeleteTodo(ctx, uid); err != nil {
-					result.Errors = append(result.Errors, fmt.Errorf("delete CalDAV todo: %w", err))
-					continue
-				}
-				e.store.DeleteMapping(ctx, uid)
-				result.Deleted++
-			} else if e.needsUpdate(ct, dt, mapping) {
-				e.logger.Printf("Update: %s (caldav=%s dev_done=%v)", uid, ct.Status, dt.Completed)
-				if err := e.syncUpdate(ctx, &ct, &dt, mapping); err != nil {
-					result.Errors = append(result.Errors, fmt.Errorf("sync update: %w", err))
-					continue
-				}
-				result.Updated++
+			continue
+		}
+
+		deviceTodo, deviceExists := deviceIndex[mapping.DeviceTodoID]
+		if !deviceExists {
+			// 设备端删除：删除对应 CalDAV VTODO。
+			e.logger.Printf("Mapped device todo %d gone, deleting CalDAV %s", mapping.DeviceTodoID, uid)
+			if err := entry.Client.DeleteTodo(ctx, uid); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("delete CalDAV todo: %w", err))
+				continue
 			}
+			if err := e.store.DeleteMapping(ctx, entry.Path, uid); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("delete mapping %s: %w", uid, err))
+			}
+			result.Deleted++
+			continue
+		}
+
+		if e.needsUpdate(caldavTodo, deviceTodo, mapping) {
+			if err := e.syncUpdate(ctx, entry.Client, &caldavTodo, &deviceTodo, mapping); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("sync update %s: %w", uid, err))
+				continue
+			}
+			deviceIndex[deviceTodo.ID] = deviceTodo
+			result.Updated++
 		}
 	}
+
 	return result
 }
 
-// syncEvents 同步 VEVENT → 设备待办（单向）
-func (e *SyncEngine) syncEvents(ctx context.Context, client caldav.CalDAVClient, deviceIndex map[int]device.DeviceTodo, mappings []store.Mapping, eventDeviceIDs map[int]bool) *SyncResult {
+// syncEvents 同步当前仍有效、且今天或明天开始的 VEVENT 实例。
+func (e *SyncEngine) syncEvents(ctx context.Context, entry CalendarEntry, deviceIndex map[int]device.DeviceTodo, mappings []store.Mapping) *SyncResult {
 	result := &SyncResult{}
-	now := time.Now()
-	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	events, err := client.GetEvents(ctx, start, start.AddDate(0, 0, 7))
+	now := e.now()
+	loc := now.Location()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	windowEnd := dayStart.AddDate(0, 0, 2) // 明天结束（半开区间）
+
+	events, err := entry.Client.GetEvents(ctx, now, windowEnd)
 	if err != nil {
-		result.Errors = append(result.Errors, fmt.Errorf("get events: %w", err))
+		result.Errors = append(result.Errors, fmt.Errorf("get events from %s: %w", entry.Path, err))
 		return result
 	}
 
-	e.logger.Printf("Found %d events in next 7 days", len(events))
+	desired := make(map[string]caldav.EventItem)
+	for _, event := range events {
+		if event.UID == "" || !eventShouldBeVisible(event, now) {
+			continue
+		}
+		desired[eventMappingUID(event)] = event
+	}
+	e.logger.Printf("Found %d visible event instances for %s", len(desired), entry.Path)
 
 	mappingByUID := make(map[string]*store.Mapping)
 	for i := range mappings {
-		if strings.HasPrefix(mappings[i].CalDAVUID, eventUIDPrefix) {
-			mappingByUID[mappings[i].CalDAVUID] = &mappings[i]
+		mapping := &mappings[i]
+		if mapping.CalendarPath == entry.Path && strings.HasPrefix(mapping.CalDAVUID, eventUIDPrefix) {
+			mappingByUID[mapping.CalDAVUID] = mapping
 		}
 	}
 
-	for _, ev := range events {
-		if ev.UID == "" {
+	// 先清理已经到期、被删除或移出显示窗口的实例，避免重复系列长期堆积。
+	for uid, mapping := range mappingByUID {
+		if _, exists := desired[uid]; exists {
 			continue
 		}
-		euid := eventUIDPrefix + ev.UID
-		mapping, exists := mappingByUID[euid]
-
-		if exists {
-			if _, deviceExists := deviceIndex[mapping.DeviceTodoID]; !deviceExists {
-				e.logger.Printf("Recreating event todo: %s", ev.UID)
-				dt := e.convertEventToDevice(&ev)
-				created, err := e.deviceClient.CreateTodo(ctx, dt)
-				if err != nil {
-					result.Errors = append(result.Errors, fmt.Errorf("recreate event todo: %w", err))
-					continue
-				}
-				mapping.DeviceTodoID = created.ID
-				mapping.LastSyncTime = time.Now()
-				e.store.UpdateMapping(ctx, mapping)
-				deviceIndex[created.ID] = *created
-				eventDeviceIDs[created.ID] = true
-				result.EventsCreated++
+		if _, deviceExists := deviceIndex[mapping.DeviceTodoID]; deviceExists {
+			if err := e.deviceClient.DeleteTodo(ctx, mapping.DeviceTodoID); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("delete expired event todo %d: %w", mapping.DeviceTodoID, err))
+				continue
 			}
-		} else {
-			e.logger.Printf("New event: %s (%s)", ev.Summary, ev.UID)
-			dt := e.convertEventToDevice(&ev)
-			created, err := e.deviceClient.CreateTodo(ctx, dt)
+			delete(deviceIndex, mapping.DeviceTodoID)
+			result.Deleted++
+		}
+		if err := e.store.DeleteMapping(ctx, entry.Path, uid); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("delete event mapping %s: %w", uid, err))
+			continue
+		}
+		delete(mappingByUID, uid)
+	}
+
+	for uid, event := range desired {
+		mapping, exists := mappingByUID[uid]
+		if !exists {
+			deviceTodo := e.convertEventToDevice(&event)
+			created, err := e.deviceClient.CreateTodo(ctx, deviceTodo)
 			if err != nil {
 				result.Errors = append(result.Errors, fmt.Errorf("create event todo: %w", err))
 				continue
 			}
-			m := &store.Mapping{
-				CalDAVUID:    euid,
-				DeviceTodoID: created.ID,
-				LastSyncTime: time.Now(),
-				CalDAVETag:   ev.ETag,
+			mapping = &store.Mapping{
+				CalendarPath:     entry.Path,
+				CalDAVUID:        uid,
+				DeviceTodoID:     created.ID,
+				DeviceUpdateDate: created.UpdateDate,
+				LastSyncTime:     now,
+				CalDAVETag:       event.ETag,
 			}
-			if err := e.safeCreateMapping(ctx, m); err != nil {
-				e.logger.Printf("Rolling back orphan event todo %d", created.ID)
-				e.deviceClient.CompleteTodo(ctx, created.ID)
-				result.Errors = append(result.Errors, fmt.Errorf("create mapping: %w", err))
+			if err := e.safeCreateMapping(ctx, mapping); err != nil {
+				e.deviceClient.DeleteTodo(ctx, created.ID)
+				result.Errors = append(result.Errors, fmt.Errorf("create event mapping: %w", err))
 				continue
 			}
-			deviceIndex[created.ID] = *created
-			eventDeviceIDs[created.ID] = true
+			indexed := *deviceTodo
+			indexed.ID = created.ID
+			indexed.UpdateDate = created.UpdateDate
+			deviceIndex[created.ID] = indexed
 			result.EventsCreated++
+			continue
+		}
+
+		deviceTodo, deviceExists := deviceIndex[mapping.DeviceTodoID]
+		expected := e.convertEventToDevice(&event)
+		if !deviceExists {
+			created, err := e.deviceClient.CreateTodo(ctx, expected)
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("recreate event todo: %w", err))
+				continue
+			}
+			mapping.DeviceTodoID = created.ID
+			mapping.DeviceUpdateDate = created.UpdateDate
+			mapping.CalDAVETag = event.ETag
+			mapping.LastSyncTime = now
+			if err := e.store.UpdateMapping(ctx, mapping); err != nil {
+				e.deviceClient.DeleteTodo(ctx, created.ID)
+				result.Errors = append(result.Errors, fmt.Errorf("update recreated event mapping: %w", err))
+				continue
+			}
+			indexed := *expected
+			indexed.ID = created.ID
+			indexed.UpdateDate = created.UpdateDate
+			deviceIndex[created.ID] = indexed
+			result.EventsCreated++
+			continue
+		}
+
+		changed := false
+		// 日历投影在设备端是只读提醒。用户误标完成时恢复为未完成，直到事件到期删除。
+		if isDeviceCompleted(deviceTodo) {
+			if err := e.deviceClient.UncompleteTodo(ctx, deviceTodo.ID); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("uncomplete event todo %d: %w", deviceTodo.ID, err))
+				continue
+			}
+			deviceTodo.Status, deviceTodo.Completed = 0, false
+			changed = true
+		}
+		if !eventTodoFieldsEqual(deviceTodo, *expected) {
+			updated, err := e.deviceClient.UpdateTodo(ctx, deviceTodo.ID, expected)
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("update event todo %d: %w", deviceTodo.ID, err))
+				continue
+			}
+			updateDate := deviceTodo.UpdateDate
+			if updated.UpdateDate != 0 {
+				updateDate = updated.UpdateDate
+			}
+			deviceTodo = *expected
+			deviceTodo.ID = mapping.DeviceTodoID
+			deviceTodo.UpdateDate = updateDate
+			deviceIndex[deviceTodo.ID] = deviceTodo
+			changed = true
+		}
+		if changed {
+			deviceIndex[deviceTodo.ID] = deviceTodo
+			result.Updated++
+		}
+
+		if mapping.CalDAVETag != event.ETag || mapping.DeviceUpdateDate != deviceTodo.UpdateDate || mapping.LastSyncTime.Before(now) {
+			mapping.CalDAVETag = event.ETag
+			mapping.DeviceUpdateDate = deviceTodo.UpdateDate
+			mapping.LastSyncTime = now
+			if err := e.store.UpdateMapping(ctx, mapping); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("update event mapping %s: %w", uid, err))
+			}
 		}
 	}
 
 	return result
 }
 
-// safeCreateMapping 创建映射；已存在则更新
-func (e *SyncEngine) safeCreateMapping(ctx context.Context, m *store.Mapping) error {
-	existing, err := e.store.GetMapping(ctx, m.CalDAVUID)
+func eventShouldBeVisible(event caldav.EventItem, now time.Time) bool {
+	if event.StartTime == nil {
+		return false
+	}
+	start := event.StartTime.In(now.Location())
+	visibleFrom := time.Date(start.Year(), start.Month(), start.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, -1)
+	if now.Before(visibleFrom) {
+		return false
+	}
+	expires := start
+	if event.EndTime != nil {
+		expires = event.EndTime.In(now.Location())
+	}
+	return !now.After(expires)
+}
+
+func eventMappingUID(event caldav.EventItem) string {
+	uid := eventUIDPrefix + event.UID
+	if event.Recurring {
+		instance := event.StartTime
+		if event.RecurrenceID != nil {
+			instance = event.RecurrenceID
+		}
+		if instance != nil {
+			uid += "::" + instance.UTC().Format("20060102T150405Z")
+		}
+	}
+	return uid
+}
+
+func (e *SyncEngine) safeCreateMapping(ctx context.Context, mapping *store.Mapping) error {
+	existing, err := e.store.GetMapping(ctx, mapping.CalendarPath, mapping.CalDAVUID)
 	if err != nil {
 		return fmt.Errorf("check mapping: %w", err)
 	}
 	if existing != nil {
-		existing.DeviceTodoID = m.DeviceTodoID
-		existing.LastSyncTime = m.LastSyncTime
-		existing.CalDAVETag = m.CalDAVETag
+		existing.DeviceTodoID = mapping.DeviceTodoID
+		existing.DeviceUpdateDate = mapping.DeviceUpdateDate
+		existing.LastSyncTime = mapping.LastSyncTime
+		existing.CalDAVETag = mapping.CalDAVETag
 		return e.store.UpdateMapping(ctx, existing)
 	}
-	return e.store.CreateMapping(ctx, m)
+	return e.store.CreateMapping(ctx, mapping)
 }
 
-// createCalDAVTodoWithMapping 创建 CalDAV VTODO 并建立映射
-func (e *SyncEngine) createCalDAVTodoWithMapping(ctx context.Context, todo *caldav.TodoItem, deviceTodoID int) error {
-	created, err := e.primaryClient().CreateTodo(ctx, todo)
+func (e *SyncEngine) createCalDAVTodoWithMapping(ctx context.Context, entry CalendarEntry, todo *caldav.TodoItem, deviceTodo device.DeviceTodo) error {
+	created, err := entry.Client.CreateTodo(ctx, todo)
 	if err != nil {
 		return err
 	}
-	m := &store.Mapping{
-		CalDAVUID:    created.UID,
-		DeviceTodoID: deviceTodoID,
-		LastSyncTime: time.Now(),
-		CalDAVETag:   created.ETag,
+	mapping := &store.Mapping{
+		CalendarPath:     entry.Path,
+		CalDAVUID:        created.UID,
+		DeviceTodoID:     deviceTodo.ID,
+		DeviceUpdateDate: deviceTodo.UpdateDate,
+		LastSyncTime:     e.now(),
+		CalDAVETag:       created.ETag,
 	}
-	return e.safeCreateMapping(ctx, m)
+	if err := e.safeCreateMapping(ctx, mapping); err != nil {
+		// 建映射失败时回滚 CalDAV 端，避免下一轮产生重复待办。
+		_ = entry.Client.DeleteTodo(ctx, created.UID)
+		return err
+	}
+	return nil
 }
 
-func (e *SyncEngine) needsUpdate(ct caldav.TodoItem, dt device.DeviceTodo, m *store.Mapping) bool {
-	if ct.ETag != m.CalDAVETag {
+func (e *SyncEngine) needsUpdate(caldavTodo caldav.TodoItem, deviceTodo device.DeviceTodo, mapping *store.Mapping) bool {
+	if isCalDAVCompleted(caldavTodo) != isDeviceCompleted(deviceTodo) {
 		return true
 	}
-	if ct.LastModTime.After(m.LastSyncTime) {
+	if !e.todoFieldsEqual(caldavTodo, deviceTodo) {
 		return true
 	}
-	if dt.UpdateDate > m.LastSyncTime.Unix() {
+	if caldavChangedSinceMapping(caldavTodo, mapping) {
 		return true
 	}
-	return false
+	return deviceChangedSinceMapping(deviceTodo, mapping)
 }
 
-// syncUpdate 状态双向同步（各自比对 mapping.LastSyncTime），策略只影响非状态字段
-func (e *SyncEngine) syncUpdate(ctx context.Context, ct *caldav.TodoItem, dt *device.DeviceTodo, m *store.Mapping) error {
-	cd := ct.Status == "COMPLETED"
-	dd := dt.Completed
-
-	if cd == dd {
-		return e.updateFields(ctx, ct, dt, m)
+func deviceChangedSinceMapping(todo device.DeviceTodo, mapping *store.Mapping) bool {
+	if mapping.DeviceUpdateDate != 0 {
+		return todo.UpdateDate != 0 && todo.UpdateDate != mapping.DeviceUpdateDate
 	}
+	return todo.UpdateDate > mapping.LastSyncTime.Unix()
+}
 
-	// 判断各自是否在上次同步后变更（与同一个本地时间参照点比较）
-	caldavChanged := ct.LastModTime.After(m.LastSyncTime) || ct.ETag != m.CalDAVETag
-	deviceChanged := dt.UpdateDate > m.LastSyncTime.Unix()
+func caldavChangedSinceMapping(todo caldav.TodoItem, mapping *store.Mapping) bool {
+	return todo.ETag != mapping.CalDAVETag || todo.LastModTime.After(mapping.LastSyncTime)
+}
 
-	var caldavWins bool
-	if caldavChanged && !deviceChanged {
-		caldavWins = true
-	} else if !caldavChanged && deviceChanged {
-		caldavWins = false
-	} else {
-		// 双方都变或都没变 → 按策略
-		caldavWins = e.conflictPolicy == RadicaleWins
-	}
+// syncUpdate 使用变更方向同步。只有两端同时变化（或无法判断）时才应用冲突策略。
+func (e *SyncEngine) syncUpdate(ctx context.Context, client caldav.CalDAVClient, caldavTodo *caldav.TodoItem, deviceTodo *device.DeviceTodo, mapping *store.Mapping) error {
+	caldavChanged := caldavChangedSinceMapping(*caldavTodo, mapping)
+	deviceChanged := deviceChangedSinceMapping(*deviceTodo, mapping)
 
-	if caldavWins {
-		if cd {
-			e.logger.Printf("Status sync: caldav wins → complete device %d", dt.ID)
-			if err := e.deviceClient.CompleteTodo(ctx, dt.ID); err != nil {
-				return fmt.Errorf("complete device: %w", err)
+	if isCalDAVCompleted(*caldavTodo) != isDeviceCompleted(*deviceTodo) {
+		winner, manual := e.chooseWinner(caldavChanged, deviceChanged)
+		if manual {
+			return e.createConflict(ctx, caldavTodo, deviceTodo)
+		}
+		if winner == RadicaleWins {
+			if isCalDAVCompleted(*caldavTodo) {
+				if err := e.deviceClient.CompleteTodo(ctx, deviceTodo.ID); err != nil {
+					return fmt.Errorf("complete device: %w", err)
+				}
+				deviceTodo.Status, deviceTodo.Completed = 1, true
+			} else {
+				if err := e.deviceClient.UncompleteTodo(ctx, deviceTodo.ID); err != nil {
+					return fmt.Errorf("uncomplete device: %w", err)
+				}
+				deviceTodo.Status, deviceTodo.Completed = 0, false
 			}
 		} else {
-			e.logger.Printf("Status sync: caldav wins → uncomplete device %d", dt.ID)
-			if err := e.deviceClient.CompleteTodo(ctx, dt.ID); err != nil {
-				return fmt.Errorf("uncomplete device: %w", err)
-			}
-		}
-	} else {
-		if dd {
-			e.logger.Printf("Status sync: device wins → complete CalDAV %s", ct.UID)
-			if pc := e.primaryClient(); pc != nil {
-				if err := pc.CompleteTodo(ctx, ct.UID); err != nil {
+			if isDeviceCompleted(*deviceTodo) {
+				if err := client.CompleteTodo(ctx, caldavTodo.UID); err != nil {
 					return fmt.Errorf("complete CalDAV: %w", err)
 				}
-			}
-		} else {
-			e.logger.Printf("Status sync: device wins → uncomplete CalDAV %s", ct.UID)
-			if pc := e.primaryClient(); pc != nil {
-				if err := pc.UncompleteTodo(ctx, ct.UID); err != nil {
+				caldavTodo.Status = "COMPLETED"
+			} else {
+				if err := client.UncompleteTodo(ctx, caldavTodo.UID); err != nil {
 					return fmt.Errorf("uncomplete CalDAV: %w", err)
 				}
+				caldavTodo.Status = "NEEDS-ACTION"
 			}
 		}
 	}
 
-	m.LastSyncTime = time.Now()
-	m.CalDAVETag = ct.ETag
-	return e.store.UpdateMapping(ctx, m)
+	if !e.todoFieldsEqual(*caldavTodo, *deviceTodo) {
+		winner, manual := e.chooseWinner(caldavChanged, deviceChanged)
+		if manual {
+			return e.createConflict(ctx, caldavTodo, deviceTodo)
+		}
+		if winner == RadicaleWins {
+			updated, err := e.deviceClient.UpdateTodo(ctx, deviceTodo.ID, e.convertCalDAVToDevice(caldavTodo))
+			if err != nil {
+				return fmt.Errorf("update device fields: %w", err)
+			}
+			if updated.UpdateDate != 0 {
+				deviceTodo.UpdateDate = updated.UpdateDate
+			}
+			expected := e.convertCalDAVToDevice(caldavTodo)
+			expected.ID = deviceTodo.ID
+			expected.UpdateDate = deviceTodo.UpdateDate
+			*deviceTodo = *expected
+		} else {
+			updated, err := client.UpdateTodo(ctx, e.convertDeviceToCalDAVWithUID(deviceTodo, caldavTodo.UID))
+			if err != nil {
+				return fmt.Errorf("update CalDAV fields: %w", err)
+			}
+			*caldavTodo = *updated
+		}
+	}
+
+	mapping.LastSyncTime = e.now()
+	mapping.CalDAVETag = caldavTodo.ETag
+	mapping.DeviceUpdateDate = deviceTodo.UpdateDate
+	return e.store.UpdateMapping(ctx, mapping)
 }
 
-func (e *SyncEngine) updateFields(ctx context.Context, ct *caldav.TodoItem, dt *device.DeviceTodo, m *store.Mapping) error {
-	switch e.conflictPolicy {
-	case DeviceWins:
-		updated := e.convertDeviceToCalDAV(dt)
-		updated.UID = ct.UID
-		pc := e.primaryClient()
-		if pc == nil {
-			return fmt.Errorf("no primary client for todo sync")
-		}
-		if _, err := pc.UpdateTodo(ctx, updated); err != nil {
-			return err
-		}
-		m.CalDAVETag = updated.ETag
-		m.LastSyncTime = time.Now()
-		return e.store.UpdateMapping(ctx, m)
-
-	case RadicaleWins:
-		updated := e.convertCalDAVToDevice(ct)
-		if _, err := e.deviceClient.UpdateTodo(ctx, dt.ID, updated); err != nil {
-			return err
-		}
-		m.LastSyncTime = time.Now()
-		m.CalDAVETag = ct.ETag
-		return e.store.UpdateMapping(ctx, m)
-
-	case Manual:
-		return e.store.CreateConflict(ctx, &store.Conflict{
-			CalDAVUID:    ct.UID,
-			DeviceTodoID: dt.ID,
-			DetectedTime: time.Now(),
-			Status:       "pending",
-		})
-
-	default:
-		return fmt.Errorf("unknown policy: %s", e.conflictPolicy)
+func (e *SyncEngine) chooseWinner(caldavChanged, deviceChanged bool) (ConflictResolution, bool) {
+	if caldavChanged && !deviceChanged {
+		return RadicaleWins, false
 	}
+	if !caldavChanged && deviceChanged {
+		return DeviceWins, false
+	}
+	if e.conflictPolicy == Manual {
+		return Manual, true
+	}
+	return e.conflictPolicy, false
+}
+
+func (e *SyncEngine) createConflict(ctx context.Context, caldavTodo *caldav.TodoItem, deviceTodo *device.DeviceTodo) error {
+	return e.store.CreateConflict(ctx, &store.Conflict{
+		CalDAVUID:    caldavTodo.UID,
+		DeviceTodoID: deviceTodo.ID,
+		DetectedTime: e.now(),
+		Status:       "pending",
+	})
+}
+
+func isCalDAVCompleted(todo caldav.TodoItem) bool {
+	return strings.EqualFold(todo.Status, "COMPLETED")
+}
+
+func isDeviceCompleted(todo device.DeviceTodo) bool {
+	return todo.Completed || todo.Status == 1
+}
+
+func (e *SyncEngine) todoFieldsEqual(caldavTodo caldav.TodoItem, deviceTodo device.DeviceTodo) bool {
+	expected := e.convertCalDAVToDevice(&caldavTodo)
+	return eventTodoFieldsEqual(deviceTodo, *expected)
+}
+
+func eventTodoFieldsEqual(actual, expected device.DeviceTodo) bool {
+	return actual.Title == expected.Title &&
+		actual.Description == expected.Description &&
+		actual.DueDate == expected.DueDate &&
+		actual.DueTime == expected.DueTime &&
+		actual.Priority == expected.Priority
 }
 
 // ---- 数据转换 ----
 
 func (e *SyncEngine) convertCalDAVToDevice(todo *caldav.TodoItem) *device.DeviceTodo {
-	dt := &device.DeviceTodo{
+	deviceTodo := &device.DeviceTodo{
 		Title:       todo.Summary,
 		Description: todo.Description,
 		DeviceID:    e.deviceClient.GetDeviceID(),
+		RepeatType:  "none",
 	}
 	if todo.DueDate != nil {
-		dt.DueDate = todo.DueDate.Format("2006-01-02")
-		dt.DueTime = todo.DueDate.Format("15:04")
+		localDue := todo.DueDate.In(time.Local)
+		deviceTodo.DueDate = localDue.Format("2006-01-02")
+		deviceTodo.DueTime = localDue.Format("15:04")
 	}
-	if todo.Status == "COMPLETED" {
-		dt.Status = 1
-		dt.Completed = true
+	if isCalDAVCompleted(*todo) {
+		deviceTodo.Status = 1
+		deviceTodo.Completed = true
 	}
 	switch todo.Priority {
 	case 1:
-		dt.Priority = 2
+		deviceTodo.Priority = 2
 	case 2:
-		dt.Priority = 1
+		deviceTodo.Priority = 1
 	}
-	return dt
+	return deviceTodo
 }
 
 func (e *SyncEngine) convertDeviceToCalDAV(todo *device.DeviceTodo) *caldav.TodoItem {
-	ct := &caldav.TodoItem{
-		UID:         fmt.Sprintf("device-%d@chronos", todo.ID),
+	return e.convertDeviceToCalDAVWithUID(todo, fmt.Sprintf("device-%d@chronos", todo.ID))
+}
+
+func (e *SyncEngine) convertDeviceToCalDAVWithUID(todo *device.DeviceTodo, uid string) *caldav.TodoItem {
+	caldavTodo := &caldav.TodoItem{
+		UID:         uid,
 		Summary:     todo.Title,
 		Description: todo.Description,
 	}
 	if todo.DueDate != "" {
 		dueStr := todo.DueDate
+		layout := "2006-01-02"
 		if todo.DueTime != "" {
-			dueStr += "T" + todo.DueTime + ":00"
-		} else {
-			dueStr += "T00:00:00"
+			dueStr += "T" + todo.DueTime
+			layout += "T15:04"
 		}
-		if t, err := time.Parse("2006-01-02T15:04:05", dueStr); err == nil {
-			ct.DueDate = &t
+		if due, err := time.ParseInLocation(layout, dueStr, time.Local); err == nil {
+			caldavTodo.DueDate = &due
 		}
 	}
-	if todo.Status == 1 {
-		ct.Status = "COMPLETED"
+	if isDeviceCompleted(*todo) {
+		caldavTodo.Status = "COMPLETED"
 	} else {
-		ct.Status = "NEEDS-ACTION"
+		caldavTodo.Status = "NEEDS-ACTION"
 	}
 	switch todo.Priority {
 	case 2:
-		ct.Priority = 1
+		caldavTodo.Priority = 1
 	case 1:
-		ct.Priority = 2
+		caldavTodo.Priority = 2
 	}
-	return ct
+	return caldavTodo
 }
 
-func (e *SyncEngine) convertEventToDevice(ev *caldav.EventItem) *device.DeviceTodo {
-	dt := &device.DeviceTodo{
-		Title:       ev.Summary,
-		Description: ev.Description,
+func (e *SyncEngine) convertEventToDevice(event *caldav.EventItem) *device.DeviceTodo {
+	deviceTodo := &device.DeviceTodo{
+		Title:       event.Summary,
+		Description: event.Description,
 		DeviceID:    e.deviceClient.GetDeviceID(),
-		Priority:    0,
+		RepeatType:  "none",
 	}
-	if ev.StartTime != nil {
-		dt.DueDate = ev.StartTime.Format("2006-01-02")
-		dt.DueTime = ev.StartTime.Format("15:04")
+	if event.StartTime != nil {
+		localStart := event.StartTime.In(time.Local)
+		deviceTodo.DueDate = localStart.Format("2006-01-02")
+		if !event.AllDay {
+			deviceTodo.DueTime = localStart.Format("15:04")
+		}
 	}
-	return dt
+	return deviceTodo
 }

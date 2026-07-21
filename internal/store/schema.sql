@@ -1,12 +1,15 @@
 -- 同步映射表
 CREATE TABLE IF NOT EXISTS mappings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    caldav_uid TEXT NOT NULL UNIQUE,
+    calendar_path TEXT NOT NULL DEFAULT '',
+    caldav_uid TEXT NOT NULL,
     device_todo_id INTEGER NOT NULL,
+    device_update_date INTEGER NOT NULL DEFAULT 0,
     last_sync_time DATETIME NOT NULL,
     caldav_etag TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(calendar_path, caldav_uid)
 );
 
 -- 冲突记录表
@@ -37,7 +40,7 @@ CREATE TABLE IF NOT EXISTS sync_logs (
 );
 
 -- 创建索引
-CREATE INDEX IF NOT EXISTS idx_mappings_caldav_uid ON mappings(caldav_uid);
+CREATE INDEX IF NOT EXISTS idx_mappings_calendar_uid ON mappings(calendar_path, caldav_uid);
 CREATE INDEX IF NOT EXISTS idx_mappings_device_todo_id ON mappings(device_todo_id);
 CREATE INDEX IF NOT EXISTS idx_conflicts_status ON conflicts(status);
 CREATE INDEX IF NOT EXISTS idx_sync_logs_sync_time ON sync_logs(sync_time);
